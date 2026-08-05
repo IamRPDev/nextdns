@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/godbus/dbus/v5"
@@ -21,10 +22,12 @@ const (
 	dbusName      = "org.freedesktop.resolve1"
 	dbusPath      = "/org/freedesktop/resolve1"
 	dbusInterface = "org.freedesktop.resolve1.Manager"
+	linkInterface = "org.freedesktop.resolve1.Link"
 	stateFile     = "/var/run/nextdns-resolved-state.json"
 )
 
 var errUnavailable = errors.New("systemd-resolved D-Bus API unavailable")
+var dnsMu sync.Mutex
 
 type state struct {
 	Mode  string `json:"mode"`
@@ -34,13 +37,6 @@ type state struct {
 type dns struct {
 	Family  int32
 	Address []byte
-}
-
-type dnsEx struct {
-	Family     int32
-	Address    []byte
-	Port       uint16
-	ServerName string
 }
 
 // StubConfig describes the active systemd-resolved DNS stub listener.
@@ -64,6 +60,12 @@ func hasOwner(conn *dbus.Conn) bool {
 }
 
 func SetDNS(ip string, port uint16) error {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	return setDNS(ip, port)
+}
+
+func setDNS(ip string, port uint16) error {
 	if port == 0 {
 		port = 53
 	}
@@ -102,6 +104,12 @@ func SetDNS(ip string, port uint16) error {
 }
 
 func ResetDNS() error {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	return resetDNS()
+}
+
+func resetDNS() error {
 	s, err := readState()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -126,6 +134,101 @@ func ResetDNS() error {
 		return firstErr
 	}
 	return os.Remove(stateFile)
+}
+
+// EnsureDNS repairs active links whose DNS configuration was replaced after
+// SetDNS. It is a no-op unless NextDNS previously configured resolved.
+func EnsureDNS(ip string, port uint16) (bool, error) {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+
+	s, err := readState()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if s.Mode != "resolved-dbus" {
+		return false, nil
+	}
+	if port == 0 {
+		port = 53
+	}
+	family, addr, err := parseIP(ip)
+	if err != nil {
+		return false, err
+	}
+	want := dnsServer{
+		Family:  family,
+		Address: addr,
+		Port:    port,
+	}
+
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return false, err
+	}
+	if !hasOwner(conn) {
+		return false, errUnavailable
+	}
+	links, err := activeLinks()
+	if err != nil {
+		return false, err
+	}
+	active := make(map[int]struct{}, len(links))
+	tracked := make(map[int]struct{}, len(s.Links)+len(links))
+	for _, link := range s.Links {
+		tracked[link] = struct{}{}
+	}
+
+	var repaired bool
+	var errs []error
+	for _, link := range links {
+		active[link] = struct{}{}
+		servers, err := linkDNS(conn, link)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("systemd-resolved: read link DNS %d: %w", link, err))
+			continue
+		}
+		if !dnsConfigMatches(servers, want) {
+			if err := setLinkDNS(conn, link, ip, port); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			repaired = true
+		}
+		tracked[link] = struct{}{}
+	}
+
+	for _, link := range s.Links {
+		if _, ok := active[link]; ok {
+			continue
+		}
+		call := conn.Object(dbusName, dbus.ObjectPath(dbusPath)).
+			Call(dbusInterface+".RevertLink", 0, int32(link))
+		if call.Err != nil && !isNoSuchLink(call.Err) {
+			errs = append(errs, fmt.Errorf("systemd-resolved: revert inactive link %d: %w", link, call.Err))
+			continue
+		}
+		delete(tracked, link)
+	}
+
+	newLinks := make([]int, 0, len(tracked))
+	for link := range tracked {
+		newLinks = append(newLinks, link)
+	}
+	slices.Sort(newLinks)
+	if !slices.Equal(s.Links, newLinks) {
+		s.Links = newLinks
+		if err := writeState(s); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if repaired {
+		_ = flushCaches(conn)
+	}
+	return repaired, errors.Join(errs...)
 }
 
 func StateExists() bool {
@@ -203,7 +306,7 @@ func setLinkDNS(conn *dbus.Conn, link int, ip string, port uint16) error {
 		dbusInterface+".SetLinkDNSEx",
 		0,
 		int32(link),
-		[]dnsEx{{
+		[]dnsServer{{
 			Family:     family,
 			Address:    addr,
 			Port:       port,
@@ -229,6 +332,54 @@ func setLinkDNS(conn *dbus.Conn, link int, ip string, port uint16) error {
 		return fmt.Errorf("systemd-resolved: set link dns %d: %w", link, call.Err)
 	}
 	return nil
+}
+
+func linkDNS(conn *dbus.Conn, link int) ([]dnsServer, error) {
+	var path dbus.ObjectPath
+	call := conn.Object(dbusName, dbus.ObjectPath(dbusPath)).
+		Call(dbusInterface+".GetLink", 0, int32(link))
+	if call.Err != nil {
+		return nil, call.Err
+	}
+	if err := call.Store(&path); err != nil {
+		return nil, err
+	}
+	obj := conn.Object(dbusName, path)
+	if v, err := obj.GetProperty(linkInterface + ".DNSEx"); err == nil {
+		var servers []dnsServer
+		if err := v.Store(&servers); err == nil {
+			return servers, nil
+		}
+	}
+	v, err := obj.GetProperty(linkInterface + ".DNS")
+	if err != nil {
+		return nil, err
+	}
+	var legacy []dns
+	if err := v.Store(&legacy); err != nil {
+		return nil, err
+	}
+	servers := make([]dnsServer, 0, len(legacy))
+	for _, server := range legacy {
+		servers = append(servers, dnsServer{
+			Family:  server.Family,
+			Address: server.Address,
+			Port:    53,
+		})
+	}
+	return servers, nil
+}
+
+func isNoSuchLink(err error) bool {
+	const name = "org.freedesktop.resolve1.NoSuchLink"
+	switch err := err.(type) {
+	case dbus.Error:
+		return err.Name == name
+	case *dbus.Error:
+		return err.Name == name
+	default:
+		return false
+	}
 }
 
 func revertLinks(conn *dbus.Conn, links []int) error {

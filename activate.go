@@ -61,8 +61,24 @@ func listenAddr(listen string) (string, uint16, error) {
 }
 
 func activate(c config.Config) error {
+	listenIP, listenPort, err := activationDNS(c)
+	if err != nil {
+		return err
+	}
+	return host.SetDNS(listenIP, listenPort)
+}
+
+func ensureActivated(c config.Config) (bool, error) {
+	listenIP, listenPort, err := activationDNS(c)
+	if err != nil {
+		return false, err
+	}
+	return host.EnsureDNS(listenIP, listenPort)
+}
+
+func activationDNS(c config.Config) (string, uint16, error) {
 	if len(c.Listens) == 0 {
-		return errors.New("missing listen setting")
+		return "", 0, errors.New("missing listen setting")
 	}
 	listen := c.Listens[0]
 	if c.SetupRouter {
@@ -74,9 +90,9 @@ func activate(c config.Config) error {
 	}
 	listenIP, listenPort, err := listenAddr(listen)
 	if err != nil {
-		return err
+		return "", 0, err
 	}
-	return host.SetDNS(listenIP, listenPort)
+	return listenIP, listenPort, nil
 }
 
 func deactivate() error {

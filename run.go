@@ -226,6 +226,35 @@ func run(args []string) error {
 		})
 	}
 
+	if c.AutoActivate && runtime.GOOS == "linux" {
+		p.OnInit = append(p.OnInit, func(ctx context.Context) {
+			// systemd-resolved does not guarantee PropertiesChanged signals for
+			// per-link DNS, so periodically repair configuration replaced by a
+			// network manager after activation.
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			var lastErr string
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					repaired, err := ensureActivated(c)
+					if err != nil {
+						if msg := err.Error(); msg != lastErr {
+							log.Errorf("Ensure system DNS: %v", err)
+							lastErr = msg
+						}
+						continue
+					}
+					lastErr = ""
+					if repaired {
+						log.Info("Reactivated system DNS")
+					}
+				}
+			}
+		})
+	}
 	if c.AutoActivate {
 		p.OnStarted = append(p.OnStarted, func() {
 			log.Info("Activating")

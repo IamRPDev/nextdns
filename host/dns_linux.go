@@ -78,6 +78,10 @@ func SetDNS(dns string, port uint16) error {
 	return nil
 }
 
+func EnsureDNS(dns string, port uint16) (bool, error) {
+	return resolved.EnsureDNS(dns, port)
+}
+
 func setDNSResolvConf(dns string, port uint16) error {
 	if port != 53 {
 		return fmt.Errorf("setup resolv.conf: non 53 port not supported without systemd-resolved D-Bus")
