@@ -1,7 +1,7 @@
 #!/bin/sh
 
 main() {
-    OS=$(detect_os)
+    OS=$(detect_os) || exit 1
     GOARCH=$(detect_goarch)
     GOOS=$(detect_goos)
     NEXTDNS_BIN=$(bin_location)
@@ -982,7 +982,8 @@ detect_os() {
     fi
     case $(uname -s) in
     Linux)
-        case $(uname -o) in
+        uname_os=$(uname -o 2>/dev/null)
+        case $uname_os in
         GNU/Linux|Linux)
             if grep -q -e '^EdgeRouter' -e '^UniFiSecurityGateway' /etc/version 2> /dev/null; then
                 echo "edgeos"; return 0
@@ -1020,6 +1021,10 @@ detect_os() {
         ASUSWRT-Merlin*)
             echo "asuswrt-merlin"; return 0
             ;;
+        ASUSWRT)
+            log_error "Stock ASUSWRT is not supported. ASUSWRT-Merlin is supported."
+            return 1
+            ;;
         DD-WRT)
             echo "ddwrt"; return 0
         esac
@@ -1052,7 +1057,12 @@ detect_os() {
         ;;
     *)
     esac
-    log_error "Unsupported OS: $(uname -o) $(grep ID "/etc/os-release" 2>/dev/null | xargs)"
+    os_id=
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        os_id=$(. /etc/os-release; printf '%s' "$ID")
+    fi
+    log_error "Unsupported OS: $(uname -o 2>/dev/null)${os_id:+ (ID=$os_id)}"
     return 1
 }
 
