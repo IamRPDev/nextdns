@@ -149,6 +149,9 @@ func run(args []string) error {
 	// When running interactive, ignore config file unless explicitly specified.
 	useStorage := service.CurrentRunMode() == service.RunModeService
 	c.Parse("nextdns "+cmd, args, useStorage)
+	if err := c.Validate(); err != nil {
+		return err
+	}
 
 	log, err := host.NewLogger("nextdns")
 	if err != nil {
@@ -241,6 +244,7 @@ func run(args []string) error {
 	var startupUnix atomic.Int64
 	startupUnix.Store(time.Now().UnixNano())
 	p.resolver = &resolver.DNS{
+		MaxInflightRequests: c.MaxInflightUpstreamRequests,
 		DOH: resolver.DOH{
 			ExtraHeaders: http.Header{
 				"User-Agent": []string{fmt.Sprintf("nextdns-cli/%s (%s; %s; %s)", version, platform, runtime.GOARCH, host.InitType())},
@@ -400,9 +404,10 @@ func run(args []string) error {
 		fwd := make(config.Forwarders, 0, len(c.Forwarders)+1)
 		fwd = append(fwd, c.Forwarders...)
 		fwd = append(fwd, config.Resolver{Resolver: p.resolver})
-		if sharedCache != nil {
-			for i := range fwd {
-				if r, ok := fwd[i].Resolver.(*resolver.DNS); ok {
+		for i := range fwd {
+			if r, ok := fwd[i].Resolver.(*resolver.DNS); ok {
+				r.MaxInflightRequests = c.MaxInflightUpstreamRequests
+				if sharedCache != nil {
 					r.DNS53.Cache = sharedCache
 					r.DNS53.CacheMaxAge = cacheMaxAge
 					r.DOH.Cache = sharedCache

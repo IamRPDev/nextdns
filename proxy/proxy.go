@@ -60,8 +60,9 @@ type Proxy struct {
 	// being cancelled.
 	Timeout time.Duration
 
-	// Maximum number of inflight requests. Further requests will
-	// not be answered.
+	// Maximum number of inflight requests. Further UDP requests receive
+	// SERVFAIL and further TCP connections are closed without blocking a
+	// listener loop.
 	MaxInflightRequests uint
 
 	// QueryLog specifies an optional log function called for each received query.
@@ -77,6 +78,8 @@ type Proxy struct {
 }
 
 const defaultMaxInflightRequests = 256
+
+var errTooManyInflightRequests = errors.New("too many inflight proxy requests")
 
 // ListenAndServe listens on UDP and TCP and serve DNS queries. If ctx is
 // canceled, listeners are closed and ListenAndServe returns context.Canceled
@@ -201,6 +204,15 @@ func (p Proxy) maxInflightRequests() int {
 		return defaultMaxInflightRequests
 	}
 	return int(p.MaxInflightRequests)
+}
+
+func tryAcquireRequest(inflightRequests chan struct{}) bool {
+	select {
+	case inflightRequests <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p Proxy) logQuery(q QueryInfo) {

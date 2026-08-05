@@ -30,7 +30,7 @@ type DNS53 struct {
 
 var defaultDialer = &net.Dialer{}
 
-func (r DNS53) resolve(ctx context.Context, q query.Query, buf []byte, addr string) (n int, i ResolveInfo, err error) {
+func (r DNS53) resolve(ctx context.Context, q query.Query, buf []byte, addr string, limiter *requestLimiter) (n int, i ResolveInfo, err error) {
 	i.Transport = "UDP"
 	var now time.Time
 	n = 0
@@ -47,6 +47,10 @@ func (r DNS53) resolve(ctx context.Context, q query.Query, buf []byte, addr stri
 			}
 		}
 	}
+	if err := limiter.tryAcquire(); err != nil {
+		return n, i, err
+	}
+	defer limiter.release()
 	d := r.Dialer
 	if d == nil {
 		d = defaultDialer

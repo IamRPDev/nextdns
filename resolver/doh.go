@@ -55,7 +55,7 @@ type DOH struct {
 }
 
 // resolve perform the the DoH call.
-func (r *DOH) resolve(ctx context.Context, q query.Query, buf []byte, rt http.RoundTripper) (n int, i ResolveInfo, err error) {
+func (r *DOH) resolve(ctx context.Context, q query.Query, buf []byte, rt http.RoundTripper, limiter *requestLimiter) (n int, i ResolveInfo, err error) {
 	var ci ClientInfo
 	if r.ClientInfo != nil {
 		ci = r.ClientInfo(q)
@@ -107,6 +107,10 @@ func (r *DOH) resolve(ctx context.Context, q query.Query, buf []byte, rt http.Ro
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
+	if err := limiter.tryAcquire(); err != nil {
+		return n, i, err
+	}
+	defer limiter.release()
 	res, err := rt.RoundTrip(req)
 	if err != nil {
 		return n, i, err

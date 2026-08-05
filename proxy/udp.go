@@ -59,12 +59,10 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 	localPort := addrPort(c.LocalAddr())
 
 	for {
-		inflightRequests <- struct{}{}
 		bp := bpool.Get().(*tcpBuf)
 		buf := bp[:]
 		qsize, lip, raddr, err := readUDP(c, buf)
 		if err != nil {
-			<-inflightRequests
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				bpool.Put(bp)
 				continue
@@ -74,10 +72,13 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 		}
 		if qsize <= 14 {
 			bpool.Put(bp)
-			<-inflightRequests
 			continue
 		}
 		start := time.Now()
+		if !tryAcquireRequest(inflightRequests) {
+			p.rejectUDP(c, &bpool, bp, qsize, lip, raddr, localPort, start)
+			continue
+		}
 		go func(bp *tcpBuf, qsize int, lip net.IP, raddr *net.UDPAddr, start time.Time) {
 			var err error
 			var rsize int
@@ -153,6 +154,38 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 			}
 		}(bp, qsize, lip, raddr, start)
 	}
+}
+
+func (p Proxy) rejectUDP(c *net.UDPConn, bpool *sync.Pool, bp *tcpBuf, qsize int, lip net.IP, raddr *net.UDPAddr, localPort int, start time.Time) {
+	buf := bp[:]
+	sourceIP := addrIP(raddr)
+	remotePort := addrPort(raddr)
+	q, parseErr := query.New(buf[:qsize], sourceIP, lip)
+	err := errTooManyInflightRequests
+	rcode := dnsmessage.RCodeServerFailure
+	if parseErr != nil {
+		err = parseErr
+		rcode = dnsmessage.RCodeFormatError
+	}
+	rsize := replyRCode(rcode, q, buf)
+	_, _, writeErr := c.WriteMsgUDP(buf[:rsize], oobWithSrc(lip), raddr)
+	if writeErr != nil {
+		err = fmt.Errorf("%v (write: %w)", err, writeErr)
+	}
+	bpool.Put(bp)
+	p.logQuery(QueryInfo{
+		SourceIP:     sourceIP,
+		RemotePort:   remotePort,
+		LocalPort:    localPort,
+		PeerIP:       q.PeerIP,
+		Protocol:     "UDP",
+		Type:         q.Type.String(),
+		Name:         q.Name,
+		QuerySize:    qsize,
+		ResponseSize: rsize,
+		Duration:     time.Since(start),
+		Error:        err,
+	})
 }
 
 // readUDP reads from c to buf and returns the local and remote addresses.
